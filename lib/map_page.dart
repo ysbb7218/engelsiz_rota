@@ -9,6 +9,7 @@ import 'package:intl/intl.dart';
 import 'package:maplibre_gl/maplibre_gl.dart' as maplibre;
 import 'package:engelsiz_rota/theme/app_theme.dart';
 import 'package:engelsiz_rota/model/marker_model.dart';
+import 'package:engelsiz_rota/view/route_details_page.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
 class MapPage extends StatefulWidget {
@@ -18,41 +19,7 @@ class MapPage extends StatefulWidget {
   State<MapPage> createState() => _MapPageState();
 }
 
-// EKLE: _MapPageState'in ÜSTÜNE
-class TurnStep {
-  final String instruction; // ORS instruction
-  final double distance; // m
-  final double duration; // s
-  final LatLng location; // manevra koordinatı
-  final String maneuver; // "turn-right", "arrive", ...
-
-  TurnStep({
-    required this.instruction,
-    required this.distance,
-    required this.duration,
-    required this.location,
-    required this.maneuver,
-  });
-}
-
 class _MapPageState extends State<MapPage> {
-  Timer? _ttsDebounce;
-
-  // Konum akışı
-  Position? _lastPosition;
-  StreamSubscription<Position>? _posSub;
-  LatLng? get _currentLatLng => _lastPosition == null
-      ? null
-      : LatLng(_lastPosition!.latitude, _lastPosition!.longitude);
-
-  // Bayrakları sınıf alanı yap
-  bool _hasAnnouncedRouteStart = false;
-  bool _hasAnnouncedDestinationReached = false;
-  int? _lastAnnouncedTurnIndex;
-
-  // Marker hızlı erişim cache'i (tap'te detay göstermek için)
-  final Map<String, MarkerModel> _markerCache = {};
-
   static const String _mapTilerKey = 'RUlFyEFNM0RNo0FrC3ch';
   static const String _orsApiKey =
       'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjQ4MGE1MzhlMWIwNTRiOGZiOTE5YTg3M2NmYzQ3MzJjIiwiaCI6Im11cm11cjY0In0=';
@@ -66,25 +33,11 @@ class _MapPageState extends State<MapPage> {
   // TTS Controller for voice guidance
   FlutterTts? _flutterTts;
   bool _isVoiceEnabled = true;
-  bool _isClusteringEnabled = false; // Tracks clustering state
-  bool _isNavigating = false;
-  bool _compassEnabled = false; // Map üzerinde pusulayı aç/kapat
-
-  // Üstte gösterilecek yönlendirme bandı için
-  String _turnBannerText = ''; // örn: "120 m sonra sağa dön"
 
   final Map<String, maplibre.Symbol> _symbols = {};
   maplibre.Symbol? _currentLocationSymbol;
   maplibre.Symbol? _endPointSymbol;
   maplibre.Line? _routeLine;
-
-  // EKLE: _MapPageState içinde alanlar arasına
-  LatLng? _livePos; // anlık konum
-  List<TurnStep> _steps = []; // turn-by-turn adımlar
-  int _currentStepIdx = 0; // sıradaki adım index
-
-  String _nextTurnText = ''; // UI'da gösterilecek
-  double _nextTurnDistM = 0; // sıradaki adıma kalan mesafe
 
   // Rota sembollerini takip etmek için
   final List<maplibre.Symbol> _routeSymbols = [];
@@ -95,23 +48,25 @@ class _MapPageState extends State<MapPage> {
   // Erişilebilir nokta sayısını takip etmek için
   int _totalAccessiblePoints = 0;
 
-  // Son sesli uyarı verilen noktaları takip etmek için
-  final Set<String> _announcedPoints = {};
-
   // Rota dışında olduğunu duyurmak için
   bool _hasAnnouncedOffRoute = false;
 
   // Hedef noktaya ulaştığını duyurmak için
-  // bool _hasAnnouncedDestinationReached = false;
+  bool _hasAnnouncedDestinationReached = false;
 
   LatLng? startPoint;
   LatLng? endPoint;
   List<LatLng> routePoints = [];
+  List<RouteWaypoint> routeWaypoints = []; // Waypoint'ler için yön bilgisi
+  List<Map<String, dynamic>> navigationSteps =
+      []; // Navigasyon adımları ve sebepleri
   double? routeDistanceKm;
   double? routeDurationMin;
   String selectedFilter = 'hepsi';
   String selectedProfile = 'wheelchair'; // Sadece tekerlekli sandalye
   bool isStartPointFixed = false; // Başlangıç noktası sabit mi?
+  bool isNavigationStarted = false; // Navigasyon başlatıldı mı?
+  int currentStepIndex = 0; // Mevcut adım indeksi
 
   // Erişilebilir nokta türlerini tanımla
   List<String> get _accessibleTypes => [
@@ -127,64 +82,50 @@ class _MapPageState extends State<MapPage> {
     return _accessibleTypes.contains(type);
   }
 
-  void _startPositionStream() async {
-    bool enabled = await Geolocator.isLocationServiceEnabled();
-    if (!enabled) {
-      _showMessage("Konum servisi kapalı");
-      return;
-    }
-    var permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
-        _showMessage("Konum izni reddedildi");
-        return;
-      }
-    }
-    if (permission == LocationPermission.deniedForever) {
-      _showMessage("Konum izni kalıcı olarak reddedildi");
-      return;
-    }
-
-    _posSub?.cancel();
-    _posSub =
-        Geolocator.getPositionStream(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 2, // 2m hareketten sonra güncelle
-          ),
-        ).listen((pos) async {
-          _lastPosition = pos;
-          final ll = LatLng(pos.latitude, pos.longitude);
-
-          // Başlangıç sabit değilse anlık konumu başlangıç olarak akıt
-          if (!isStartPointFixed) {
-            startPoint = ll;
-          }
-
-          updateCurrentLocationMarker(ll);
-          _updateTurnBanner();
-
-          // Sesli uyarılar artık anlık konumu baz alacak
-          await _checkAndAnnounceNearbyAccessiblePoints();
-          await _announceRouteProgress();
-          await _checkOffRoute();
-        });
-  }
-
   @override
   void initState() {
     super.initState();
     _initializeTTS();
     _listenFirestoreMarkers();
-    _startPositionStream(); // YENİ
 
     // Konumu hemen göster
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _setInitialLocation();
     });
 
-    // SİL: locationTimer kurulumunu (artık gerek yok)
+    locationTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
+      if (!isStartPointFixed) {
+        // Sadece başlangıç noktası sabit değilse güncelle
+        final pos = await _getCurrentLocation();
+        if (pos != null) {
+          updateCurrentLocationMarker(pos);
+          // Sadece navigasyon başladığında sesli uyarıları kontrol et
+          if (isNavigationStarted) {
+            await _announceRouteProgress();
+            await _checkOffRoute();
+            await _checkAndAnnounceTurnApproaching();
+          }
+
+          // Navigasyon başlatıldığında rota odaklı kamera
+          if (isNavigationStarted &&
+              _controller != null &&
+              routePoints.isNotEmpty) {
+            final bounds = _boundsFromLatLngList(routePoints);
+            if (bounds != null) {
+              await _controller!.animateCamera(
+                maplibre.CameraUpdate.newLatLngBounds(
+                  bounds,
+                  left: 40,
+                  top: 40,
+                  right: 40,
+                  bottom: 40,
+                ),
+              );
+            }
+          }
+        }
+      }
+    });
   }
 
   // TTS initialization
@@ -215,50 +156,14 @@ class _MapPageState extends State<MapPage> {
     }
   }
 
-  Future<void> _startNavigation() async {
-    if (routePoints.isEmpty || _controller == null) return;
-
-    // Rota odağı
-    final bounds = _boundsFromLatLngList(routePoints);
-    if (bounds != null) {
-      await _controller!.animateCamera(
-        maplibre.CameraUpdate.newLatLngBounds(
-          bounds,
-          left: 40,
-          top: 40,
-          right: 40,
-          bottom: 40,
-        ),
-      );
-    }
-
-    setState(() {
-      _isNavigating = true;
-      _compassEnabled = true;
-    });
-
-    _updateTurnBanner(); // ilk metni yükle
-    await _announceNavigationStart();
-  }
-
-  void _stopNavigation() {
-    setState(() {
-      _isNavigating = false;
-      _compassEnabled = false;
-      _turnBannerText = '';
-    });
-  }
-
+  // Voice guidance methods
   Future<void> _speak(String text) async {
-    if (!_isVoiceEnabled || _flutterTts == null) return;
+    if (!_isVoiceEnabled || _flutterTts == null || !isNavigationStarted) return;
+
     try {
-      _ttsDebounce?.cancel();
-      _ttsDebounce = Timer(const Duration(milliseconds: 250), () async {
-        await _flutterTts!.stop(); // mevcut sesi kes
-        await _flutterTts!.speak(text);
-      });
+      await _flutterTts!.speak(text);
     } catch (e) {
-      debugPrint('TTS Error: $e');
+      print('TTS Error: $e');
     }
   }
 
@@ -282,251 +187,262 @@ class _MapPageState extends State<MapPage> {
     }
   }
 
-  void _updateTurnBanner() {
-    final here = _currentLatLng ?? startPoint;
-    if (here == null || routePoints.length < 3) {
-      setState(() => _turnBannerText = '');
-      return;
-    }
+  Future<void> _announceRouteProgress() async {
+    if (routePoints.isEmpty || startPoint == null) return;
 
-    // Basit: en yakın "dönüş" benzeri kırılma noktası
-    for (int i = 1; i < routePoints.length - 1; i++) {
-      final prevPoint = routePoints[i - 1];
-      final currentPoint = routePoints[i];
-      final nextPoint = routePoints[i + 1];
+    // Rota üzerindeki son noktayı kontrol et
+    if (routePoints.length >= 2) {
+      final lastPoint = routePoints.last;
 
-      final toTurn = Geolocator.distanceBetween(
-        here.latitude,
-        here.longitude,
-        currentPoint.latitude,
-        currentPoint.longitude,
+      final distanceToEnd = Geolocator.distanceBetween(
+        startPoint!.latitude,
+        startPoint!.longitude,
+        lastPoint.latitude,
+        lastPoint.longitude,
       );
 
-      // 120m içindeki ilk belirgin dönüşü yakala
-      if (toTurn < 120) {
-        final b1 = _getBearing(prevPoint, currentPoint);
-        final b2 = _getBearing(currentPoint, nextPoint);
-        final diff = _getBearingDifference(b1, b2).abs();
-
-        if (diff > 35) {
-          String dir;
-          if (_getBearingDifference(b1, b2) > 0) {
-            dir = diff > 110
-                ? 'U dönüşü'
-                : (diff > 80
-                      ? 'keskin sağ'
-                      : (diff > 50 ? 'sağ' : 'hafif sağ'));
-          } else {
-            dir = diff > 110
-                ? 'U dönüşü'
-                : (diff > 80
-                      ? 'keskin sol'
-                      : (diff > 50 ? 'sol' : 'hafif sol'));
-          }
-
-          final text = '${toTurn.toInt()} m sonra $dir';
-          if (_turnBannerText != text) {
-            setState(() => _turnBannerText = text);
-          }
-          return;
-        }
+      // Sadece hedefe varıldığında duyur
+      if (distanceToEnd < 10 && !_hasAnnouncedDestinationReached) {
+        await _speak('Hedef noktaya ulaştınız! Yolculuğunuz tamamlandı.');
+        _hasAnnouncedDestinationReached = true;
       }
     }
-
-    // Yakında dönüş yoksa genel bilgi
-    setState(() {
-      if (routeDistanceKm != null && routeDurationMin != null) {
-        _turnBannerText =
-            'Rota aktif • ${routeDistanceKm!.toStringAsFixed(2)} km / ${routeDurationMin!.toStringAsFixed(0)} dk';
-      } else {
-        _turnBannerText = 'Rota aktif';
-      }
-    });
   }
 
-  Future<void> _announceRouteProgress() async {
-    if (!_isVoiceEnabled || routePoints.isEmpty || _controller == null) return;
-    final here = _currentLatLng ?? startPoint;
-    if (here == null) return;
-
-    // Rota başlangıcına yakınlık
-    final distanceToStart = Geolocator.distanceBetween(
-      here.latitude,
-      here.longitude,
-      routePoints.first.latitude,
-      routePoints.first.longitude,
-    );
-    if (distanceToStart < 20 && !_hasAnnouncedRouteStart) {
-      await _speak('Rota başlangıcına ulaştınız. Yönlendirmeyi takip edin.');
-      _hasAnnouncedRouteStart = true;
-    }
-
-    // Hedefe ulaştı mı?
-    final distanceToEnd = Geolocator.distanceBetween(
-      here.latitude,
-      here.longitude,
-      routePoints.last.latitude,
-      routePoints.last.longitude,
-    );
-    if (distanceToEnd < 10 && !_hasAnnouncedDestinationReached) {
-      await _speak('Hedef noktaya ulaştınız. Yolculuğunuz tamamlandı.');
-      _hasAnnouncedDestinationReached = true;
+  // Dönüşlere yaklaşıldığında uyarı ver
+  Future<void> _checkAndAnnounceTurnApproaching() async {
+    if (routePoints.isEmpty || startPoint == null || navigationSteps.isEmpty)
       return;
+
+    // Mevcut adımın dönüş olup olmadığını kontrol et
+    if (currentStepIndex < navigationSteps.length) {
+      final currentStep = navigationSteps[currentStepIndex];
+      final turnDirection = currentStep['turnDirection'] as String;
+      final distance = currentStep['distance'] as double;
+
+      // Dönüş adımına yaklaşıldığında uyarı ver (50 metre kala)
+      if (distance <= 50 && turnDirection != 'düz') {
+        final direction = currentStep['direction'] as String;
+        final reason = currentStep['reason'] as String;
+
+        String turnType = '';
+        switch (turnDirection) {
+          case 'sağa':
+            turnType = 'sağa dönüş';
+            break;
+          case 'sola':
+            turnType = 'sola dönüş';
+            break;
+          case 'geri':
+            turnType = 'geri dönüş';
+            break;
+          default:
+            turnType = 'dönüş';
+        }
+
+        await _speak('$turnType yaklaşıyor. $direction $reason');
+      }
+    }
+  }
+
+  // Mevcut konumdan hedefe olan kalan mesafeyi hesapla
+  double _calculateRemainingDistance() {
+    if (routePoints.isEmpty || startPoint == null) return 0.0;
+
+    double totalRemainingDistance = 0.0;
+
+    // Mevcut adımdan itibaren kalan mesafeyi hesapla
+    for (int i = currentStepIndex; i < navigationSteps.length; i++) {
+      final step = navigationSteps[i];
+      totalRemainingDistance += step['distance'] as double;
     }
 
-    // Dönüşe yaklaşma
-    if (routePoints.length >= 3) {
-      for (int i = 1; i < routePoints.length - 1; i++) {
-        final prevPoint = routePoints[i - 1];
-        final currentPoint = routePoints[i];
-        final nextPoint = routePoints[i + 1];
+    return totalRemainingDistance;
+  }
 
-        final distanceToTurn = Geolocator.distanceBetween(
-          here.latitude,
-          here.longitude,
-          currentPoint.latitude,
-          currentPoint.longitude,
-        );
+  // Kalan süreyi hesapla (tekerlekli sandalye hızı: ~1.4 m/s)
+  double _calculateRemainingDuration() {
+    final remainingDistance = _calculateRemainingDistance();
+    const wheelchairSpeed = 1.4; // m/s
+    return remainingDistance / wheelchairSpeed / 60; // dakika cinsinden
+  }
 
-        if (distanceToTurn < 30 && _lastAnnouncedTurnIndex != i) {
-          final bearing1 = _getBearing(prevPoint, currentPoint);
-          final bearing2 = _getBearing(currentPoint, nextPoint);
-          final diff = _getBearingDifference(bearing1, bearing2);
+  // Mesafeyi formatla
+  String _formatDistance(double distanceInMeters) {
+    if (distanceInMeters < 1000) {
+      return '${distanceInMeters.toInt()} m';
+    } else {
+      return '${(distanceInMeters / 1000).toStringAsFixed(1)} km';
+    }
+  }
 
-          final absDiff = diff.abs();
-          if (absDiff > 45) {
-            // yön: sağ/sol
-            final direction = diff > 0 ? 'sağa' : 'sola';
-            String grade;
-            if (absDiff > 135)
-              grade = 'U dönüşü';
-            else if (absDiff > 90)
-              grade = 'keskin $direction dönüş';
-            else
-              grade = 'hafif $direction dönüş';
-
-            await _speak('$grade yaklaşıyor. Hazırlanın.');
-            _lastAnnouncedTurnIndex = i;
-            break;
-          }
-        }
-      }
+  // Süreyi formatla
+  String _formatDuration(double durationInMinutes) {
+    if (durationInMinutes < 1) {
+      return '${(durationInMinutes * 60).toInt()} sn';
+    } else if (durationInMinutes < 60) {
+      return '${durationInMinutes.toInt()} dk';
+    } else {
+      final hours = (durationInMinutes / 60).floor();
+      final minutes = (durationInMinutes % 60).toInt();
+      return '${hours}s ${minutes}dk';
     }
   }
 
   Future<void> _announceNavigationStart() async {
-    if (startPoint != null && endPoint != null && !_hasAnnouncedRouteStart) {
+    if (startPoint != null && endPoint != null) {
       final announcement =
           'Navigasyon başlatılıyor. Başlangıç noktasından hedef noktaya doğru yönlendiriliyorsunuz.';
       await _speak(announcement);
-      _hasAnnouncedRouteStart = true;
     }
   }
 
   Future<void> _announceAccessiblePointNearby(LatLng point, String type) async {
-    final here = _currentLatLng ?? startPoint;
-    if (here == null) return;
-
-    final distance = Geolocator.distanceBetween(
-      here.latitude,
-      here.longitude,
-      point.latitude,
-      point.longitude,
-    );
-
-    final distanceText = distance < 1000
-        ? '${distance.toInt()} metre'
-        : '${(distance / 1000).toStringAsFixed(1)} kilometre';
-
-    final typeText = _typeToLabel(type);
-    await _speak('Yakınınızda $typeText bulunuyor. Mesafe: $distanceText.');
-  }
-
-  Future<void> _checkAndAnnounceNearbyAccessiblePoints() async {
-    if (!_isVoiceEnabled) return;
-    final here = _currentLatLng ?? startPoint;
-    if (here == null) return;
-
-    try {
-      final snapshot = await FirebaseFirestore.instance
-          .collection('markers')
-          .get();
-      for (final doc in snapshot.docs) {
-        final marker = MarkerModel.fromMap(doc.data());
-        if (!_isAccessibleType(marker.type)) continue;
-        final point = LatLng(marker.latitude, marker.longitude);
-
-        final distance = Geolocator.distanceBetween(
-          here.latitude,
-          here.longitude,
-          point.latitude,
-          point.longitude,
-        );
-
-        final key = '${marker.latitude}_${marker.longitude}';
-        if (distance <= 50) {
-          if (!_announcedPoints.contains(key)) {
-            _announcedPoints.add(key);
-            await _announceAccessiblePointNearby(point, marker.type);
-          }
-        } else {
-          _announcedPoints.remove(key);
-        }
-      }
-    } catch (e) {
-      debugPrint('Yakındaki noktalar kontrol edilirken hata: $e');
-    }
+    // Bu metod artık kullanılmıyor - sadece navigasyon sırasında sesli uyarı
+    return;
   }
 
   Future<void> _announceRouteCleared() async {
-    await _speak('Rota temizlendi. Yeni rota oluşturabilirsiniz.');
+    // Bu metod artık kullanılmıyor - sadece navigasyon sırasında sesli uyarı
+    return;
+  }
+
+  // Navigasyon başlatma fonksiyonu
+  Future<void> startNavigation() async {
+    if (routePoints.isEmpty) {
+      _showMessage('Önce rota oluşturun');
+      return;
+    }
+
+    setState(() {
+      isNavigationStarted = true;
+      currentStepIndex = 0;
+    });
+
+    // Rota odaklı kamera ayarı
+    if (_controller != null && routePoints.isNotEmpty) {
+      final bounds = _boundsFromLatLngList(routePoints);
+      if (bounds != null) {
+        await _controller!.animateCamera(
+          maplibre.CameraUpdate.newLatLngBounds(
+            bounds,
+            left: 40,
+            top: 40,
+            right: 40,
+            bottom: 40,
+          ),
+        );
+      }
+    }
+
+    // Sesli yönlendirme başlat
+    await _speak('Navigasyon başlatıldı. Rota takip ediliyor.');
+    await _announceCurrentStep();
+
+    // Rota odaklı kamera ayarı
+    if (_controller != null && routePoints.isNotEmpty) {
+      final bounds = _boundsFromLatLngList(routePoints);
+      if (bounds != null) {
+        await _controller!.animateCamera(
+          maplibre.CameraUpdate.newLatLngBounds(
+            bounds,
+            left: 40,
+            top: 40,
+            right: 40,
+            bottom: 40,
+          ),
+        );
+      }
+    }
+  }
+
+  // Navigasyon sonlandırma fonksiyonu
+  Future<void> stopNavigation() async {
+    setState(() {
+      isNavigationStarted = false;
+      currentStepIndex = 0;
+    });
+
+    // Rota üzerindeki hedef noktaları sil
+    clearRoute();
+
+    await _speak('Navigasyon sonlandırıldı.');
+  }
+
+  // Mevcut adımı duyur
+  Future<void> _announceCurrentStep() async {
+    if (!isNavigationStarted || navigationSteps.isEmpty) return;
+
+    if (currentStepIndex < navigationSteps.length) {
+      final step = navigationSteps[currentStepIndex];
+      final direction = step['direction'];
+      final distance = step['distance'] as double;
+      final reason = step['reason'];
+
+      String distanceText = distance < 1000
+          ? '${distance.toInt()} metre'
+          : '${(distance / 1000).toStringAsFixed(1)} kilometre';
+
+      await _speak('$direction $distanceText. $reason');
+    } else {
+      await _speak('Hedef noktaya ulaştınız!');
+    }
+  }
+
+  // Yön hesaplama
+  String _getDirection(LatLng from, LatLng to) {
+    final bearing = _getBearing(from, to);
+
+    if (bearing >= 337.5 || bearing < 22.5) {
+      return 'Kuzey yönünde';
+    } else if (bearing >= 22.5 && bearing < 67.5) {
+      return 'Kuzeydoğu yönünde';
+    } else if (bearing >= 67.5 && bearing < 112.5) {
+      return 'Doğu yönünde';
+    } else if (bearing >= 112.5 && bearing < 157.5) {
+      return 'Güneydoğu yönünde';
+    } else if (bearing >= 157.5 && bearing < 202.5) {
+      return 'Güney yönünde';
+    } else if (bearing >= 202.5 && bearing < 247.5) {
+      return 'Güneybatı yönünde';
+    } else if (bearing >= 247.5 && bearing < 292.5) {
+      return 'Batı yönünde';
+    } else {
+      return 'Kuzeybatı yönünde';
+    }
   }
 
   Future<void> _announceLocationUpdated() async {
-    await _speak('Konumunuz güncellendi.');
+    // Bu metod artık kullanılmıyor - sadece navigasyon sırasında sesli uyarı
+    return;
   }
 
   Future<void> _announceMarkerAdded(String type) async {
-    final typeText = _typeToLabel(type);
-    await _speak('$typeText erişim noktası başarıyla eklendi.');
-  }
-
-  double _pointToSegmentDistanceMeters(LatLng p, LatLng a, LatLng b) {
-    // Basit yaklaşım: küçük segmentlerde uç noktaların min'i çoğu durumda yeterli
-    final d1 = Geolocator.distanceBetween(
-      p.latitude,
-      p.longitude,
-      a.latitude,
-      a.longitude,
-    );
-    final d2 = Geolocator.distanceBetween(
-      p.latitude,
-      p.longitude,
-      b.latitude,
-      b.longitude,
-    );
-    return min(d1, d2);
-  }
-
-  double _distanceToPolylineMeters(LatLng p, List<LatLng> poly) {
-    if (poly.length < 2) return double.infinity;
-    double best = double.infinity;
-    for (int i = 0; i < poly.length - 1; i++) {
-      best = min(best, _pointToSegmentDistanceMeters(p, poly[i], poly[i + 1]));
-    }
-    return best;
+    // Bu metod artık kullanılmıyor - sadece navigasyon sırasında sesli uyarı
+    return;
   }
 
   Future<void> _checkOffRoute() async {
-    if (routePoints.isEmpty) return;
-    final here = _currentLatLng ?? startPoint;
-    if (here == null) return;
+    if (routePoints.isEmpty || startPoint == null) return;
 
-    final d = _distanceToPolylineMeters(here, routePoints);
-    if (d > 50 && !_hasAnnouncedOffRoute) {
+    double minDistanceToRoute = double.infinity;
+
+    for (final routePoint in routePoints) {
+      final distance = Geolocator.distanceBetween(
+        startPoint!.latitude,
+        startPoint!.longitude,
+        routePoint.latitude,
+        routePoint.longitude,
+      );
+      if (distance < minDistanceToRoute) {
+        minDistanceToRoute = distance;
+      }
+    }
+
+    if (minDistanceToRoute > 50 && !_hasAnnouncedOffRoute) {
       await _speak('Rota dışındasınız. Lütfen rotaya geri dönün.');
       _hasAnnouncedOffRoute = true;
-    } else if (d <= 50) {
+    } else if (minDistanceToRoute <= 50) {
       _hasAnnouncedOffRoute = false;
     }
   }
@@ -534,46 +450,20 @@ class _MapPageState extends State<MapPage> {
   @override
   void dispose() {
     _markerSub?.cancel();
-    _posSub?.cancel(); // YENİ
-    // locationTimer?.cancel();  // SİL: Timer artık yok
+    locationTimer?.cancel();
     _controller?.dispose();
     _flutterTts?.stop();
-    _ttsDebounce?.cancel(); // YENİ
     super.dispose();
-  }
-
-  String _toHex(Color c) {
-    return '#'
-        '${c.red.toRadixString(16).padLeft(2, '0')}'
-        '${c.green.toRadixString(16).padLeft(2, '0')}'
-        '${c.blue.toRadixString(16).padLeft(2, '0')}';
   }
 
   void _onMapCreated(maplibre.MaplibreMapController controller) {
     _controller = controller;
 
-    // Tap dinleyicisini TEK KEZ bağla
-    _controller!.onSymbolTapped.add(_handleSymbolTap);
-
     // Harita hazır olduğunda konumu ve marker'ları göster
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _setInitialLocation();
-      _listenFirestoreMarkers();
+      _listenFirestoreMarkers(); // Ensure markers are loaded after map creation
     });
-  }
-
-  void _handleSymbolTap(maplibre.Symbol symbol) {
-    // docId'yi _symbols üzerinden bul
-    String? docId;
-    _symbols.forEach((k, v) {
-      if (v.id == symbol.id) docId = k;
-    });
-    if (docId == null) return;
-
-    final marker = _markerCache[docId!];
-    if (marker != null) {
-      _showMarkerDetails(marker, docId!);
-    }
   }
 
   Future<LatLng?> _getCurrentLocation() async {
@@ -690,30 +580,30 @@ class _MapPageState extends State<MapPage> {
     final coll = FirebaseFirestore.instance
         .collection('markers')
         .orderBy('createdAt', descending: true);
+    // .limit(50); // Limit kaldırıldı - tüm marker'ları göster
 
-    _markerSub?.cancel();
+    _markerSub?.cancel(); // Önceki dinleyiciyi iptal et
     _markerSub = coll.snapshots().listen((snap) async {
-      if (_controller == null) return;
-
-      final docs = snap.docs;
-
-      // Gösterilecek docId set'i (filtre uygulanmış)
-      final Set<String> wantIds = {};
-      for (final d in docs) {
-        final m = MarkerModel.fromMap(d.data());
-        _markerCache[d.id] = m; // cache güncel
-        final show = (selectedFilter == 'hepsi') || (m.type == selectedFilter);
-        if (show) wantIds.add(d.id);
+      if (_controller == null) {
+        // Controller henüz hazır değilse, bir süre bekle ve tekrar dene
+        await Future.delayed(const Duration(milliseconds: 500));
+        if (_controller == null) return; // Hala null ise çık
       }
 
-      // Bilinen ve istenen farkları hesapla
-      final Set<String> knownIds = _symbols.keys.toSet();
-      final removeIds = knownIds.difference(wantIds);
-      final addOrUpdateIds = wantIds; // hem yeni hem güncel için
+      // Filtre değiştiğinde tüm mevcut marker'ları temizle
+      for (final symbol in _symbols.values) {
+        try {
+          await _controller!.removeSymbol(symbol);
+        } catch (_) {}
+      }
+      _symbols.clear();
 
-      // SİL: Artık görünmeyecek semboller
-      for (final id in removeIds) {
-        final sym = _symbols.remove(id);
+      final currentIds = snap.docs.map((d) => d.id).toSet();
+      final knownIds = _symbols.keys.toSet();
+
+      // Kaldırılan marker'ları temizle
+      for (final removedId in knownIds.difference(currentIds)) {
+        final sym = _symbols.remove(removedId);
         if (sym != null) {
           try {
             await _controller!.removeSymbol(sym);
@@ -721,19 +611,24 @@ class _MapPageState extends State<MapPage> {
         }
       }
 
-      // EKLE/GÜNCELLE
-      for (final d in docs) {
-        final id = d.id;
-        if (!addOrUpdateIds.contains(id)) continue;
-        final marker = _markerCache[id]!;
+      // Yeni veya güncellenmiş marker'ları ekle
+      for (final doc in snap.docs) {
+        final marker = MarkerModel.fromMap(doc.data());
+
+        // Filtre kontrolü - sadece seçili tipe ait marker'ları göster
+        if (selectedFilter != 'hepsi' && marker.type != selectedFilter) {
+          continue;
+        }
+
         final lat = marker.latitude;
         final lng = marker.longitude;
+        final docId = doc.id;
 
-        if (_symbols.containsKey(id)) {
-          // Güncelle
+        if (_symbols.containsKey(docId)) {
+          // Mevcut marker'ı güncelle
           try {
             await _controller!.updateSymbol(
-              _symbols[id]!,
+              _symbols[docId]!,
               maplibre.SymbolOptions(
                 geometry: maplibre.LatLng(lat, lng),
                 textField: _typeToLabel(marker.type),
@@ -741,27 +636,30 @@ class _MapPageState extends State<MapPage> {
               ),
             );
           } catch (e) {
+            // Güncelleme başarısız olursa marker'ı yeniden oluştur
             try {
-              await _controller!.removeSymbol(_symbols[id]!);
+              await _controller!.removeSymbol(_symbols[docId]!);
             } catch (_) {}
-            _symbols.remove(id);
+            _symbols.remove(docId);
           }
         }
 
-        if (!_symbols.containsKey(id)) {
+        // Eğer marker henüz eklenmemişse veya güncelleme başarısız olduysa ekle
+        if (!_symbols.containsKey(docId)) {
           try {
             String? distanceText;
-            final here = _currentLatLng ?? startPoint;
-            if (here != null) {
+            if (startPoint != null) {
               final distance = Geolocator.distanceBetween(
-                here.latitude,
-                here.longitude,
+                startPoint!.latitude,
+                startPoint!.longitude,
                 lat,
                 lng,
               );
-              distanceText = distance < 1000
-                  ? '${distance.toInt()}m'
-                  : '${(distance / 1000).toStringAsFixed(1)}km';
+              if (distance < 1000) {
+                distanceText = '${distance.toInt()}m';
+              } else {
+                distanceText = '${(distance / 1000).toStringAsFixed(1)}km';
+              }
             }
 
             final symbol = await _controller!.addSymbol(
@@ -769,56 +667,50 @@ class _MapPageState extends State<MapPage> {
                 geometry: maplibre.LatLng(lat, lng),
                 iconImage: _getMapLibreIcon(marker.type),
                 iconSize: _getMarkerSize(marker.type),
-                iconColor: _toHex(_getMarkerColor(marker.type)),
-                iconOffset: const Offset(0, -10),
+                iconColor: _getMarkerColor(marker.type).value.toRadixString(16),
+                iconOffset: const Offset(0, -10), // Icon'u yukarı kaydır
                 iconHaloColor: '#FFFFFF',
-                iconHaloWidth: 3.0,
+                iconHaloWidth: 3.0, // Daha belirgin halo
                 textField: distanceText != null
                     ? '${_typeToLabel(marker.type)}\n$distanceText'
                     : _typeToLabel(marker.type),
-                textSize: 12.0,
+                textSize: 12.0, // Daha okunabilir text boyutu
                 textColor: _getMarkerTextColor(marker.type),
                 textHaloColor: '#FFFFFF',
-                textHaloWidth: 3.0,
-                textOffset: const Offset(0, 2.0),
+                textHaloWidth: 3.0, // Daha belirgin text halo
+                textOffset: const Offset(0, 2.0), // Text'i daha aşağı kaydır
               ),
             );
-            _symbols[id] = symbol;
+            _symbols[docId] = symbol;
+
+            _controller!.onSymbolTapped.add((symbol) {
+              if (symbol == _symbols[docId]) {
+                _showMarkerDetails(marker, docId);
+              }
+            });
           } catch (e) {
-            debugPrint('Marker eklenirken hata: $e');
+            print('Marker eklenirken hata: $e');
           }
         }
       }
 
-      // Sayaç
-      final filteredCount = wantIds.length;
-      if (mounted) {
-        setState(() {
-          _totalAccessiblePoints = filteredCount;
-        });
-      }
+      // Toplam erişilebilir nokta sayısını güncelle
+      final filteredCount = snap.docs.where((doc) {
+        final marker = MarkerModel.fromMap(doc.data());
+        return selectedFilter == 'hepsi' || marker.type == selectedFilter;
+      }).length;
+
+      setState(() {
+        _totalAccessiblePoints = filteredCount;
+      });
+
+      print(
+        '📍 Toplam marker: ${snap.docs.length}, Filtrelenmiş: $filteredCount, Filtre: $selectedFilter',
+      );
     });
   }
 
-  void _ensureCurrentLocationVisible() async {
-    if (_controller == null) return;
-
-    // Eğer konum henüz alınmadıysa ve başlangıç noktası sabit değilse, al
-    if (startPoint == null && !isStartPointFixed) {
-      final pos = await _getCurrentLocation();
-      if (pos != null) {
-        setState(() {
-          startPoint = pos;
-        });
-        updateCurrentLocationMarker(pos);
-      }
-    } else if (startPoint != null) {
-      // Konum zaten varsa, marker'ı güncelle
-      updateCurrentLocationMarker(startPoint!);
-    }
-  }
-
-  Future<List<LatLng>> getRoute(LatLng start, LatLng end) async {
+  Future<Map<String, dynamic>> getRoute(LatLng start, LatLng end) async {
     print('=== TEKERLEKLİ SANDALYE İÇİN BASİT ROTA ALGORİTMASI ===');
     print('📍 Başlangıç: ${start.latitude}, ${start.longitude}');
     print('🎯 Bitiş: ${end.latitude}, ${end.longitude}');
@@ -828,29 +720,36 @@ class _MapPageState extends State<MapPage> {
       List<LatLng> accessiblePoints = await _findAccessiblePoints(start, end);
       print('♿ ${accessiblePoints.length} erişilebilir nokta bulundu');
 
-      List<LatLng> selectedWaypoints = _selectBestWaypoints(
+      List<RouteWaypoint> selectedWaypoints = _selectBestWaypoints(
         start,
         end,
         accessiblePoints,
       );
       print('🔄 ${selectedWaypoints.length} waypoint seçildi');
 
+      // Waypoint'leri LatLng listesine çevir
+      List<LatLng> waypointLocations = selectedWaypoints
+          .map((wp) => wp.location)
+          .toList();
+
       List<LatLng> route = await _createSimpleRoute(
         start,
         end,
-        selectedWaypoints,
+        waypointLocations,
       );
 
       if (route.isNotEmpty) {
         print('✅ Rota başarıyla oluşturuldu: ${route.length} nokta');
-        return route;
+        return {'route': route, 'waypoints': selectedWaypoints};
       } else {
         print('⚠️ Rota oluşturulamadı, düz rota deneniyor');
-        return await _createDirectRoute(start, end);
+        final directRoute = await _createDirectRoute(start, end);
+        return {'route': directRoute, 'waypoints': <RouteWaypoint>[]};
       }
     } catch (e) {
       print('❌ Rota oluşturma hatası: $e');
-      return await _createDirectRoute(start, end);
+      final directRoute = await _createDirectRoute(start, end);
+      return {'route': directRoute, 'waypoints': <RouteWaypoint>[]};
     }
   }
 
@@ -911,7 +810,7 @@ class _MapPageState extends State<MapPage> {
     return accessiblePoints;
   }
 
-  List<LatLng> _selectBestWaypoints(
+  List<RouteWaypoint> _selectBestWaypoints(
     LatLng start,
     LatLng end,
     List<LatLng> points,
@@ -945,7 +844,36 @@ class _MapPageState extends State<MapPage> {
       return distA.compareTo(distB);
     });
 
-    return topPoints;
+    // Waypoint'ler için yön bilgisi oluştur
+    List<RouteWaypoint> waypoints = [];
+    for (final point in topPoints) {
+      final direction = _calculateDirection(start, end, point);
+      final reason = _getDirectionReason(direction, point);
+      final type = _getWaypointType(point);
+
+      waypoints.add(
+        RouteWaypoint(
+          location: point,
+          type: type,
+          direction: direction,
+          reason: reason,
+          distanceFromStart: Geolocator.distanceBetween(
+            start.latitude,
+            start.longitude,
+            point.latitude,
+            point.longitude,
+          ),
+          distanceToEnd: Geolocator.distanceBetween(
+            point.latitude,
+            point.longitude,
+            end.latitude,
+            end.longitude,
+          ),
+        ),
+      );
+    }
+
+    return waypoints;
   }
 
   double _calculateSimpleScore(LatLng start, LatLng end, LatLng point) {
@@ -1114,24 +1042,210 @@ class _MapPageState extends State<MapPage> {
     return diff;
   }
 
+  String _calculateDirection(LatLng start, LatLng end, LatLng waypoint) {
+    // Başlangıçtan bitişe olan ana yön
+    final mainBearing = _getBearing(start, end);
+
+    // Başlangıçtan waypoint'e olan yön
+    final waypointBearing = _getBearing(start, waypoint);
+
+    // Yön farkını hesapla
+    final bearingDiff = _getBearingDifference(mainBearing, waypointBearing);
+
+    if (bearingDiff.abs() <= 15) {
+      return 'düz';
+    } else if (bearingDiff > 0) {
+      return 'sağ';
+    } else {
+      return 'sol';
+    }
+  }
+
+  String _getDirectionReason(String direction, LatLng waypoint) {
+    switch (direction) {
+      case 'sağ':
+        return 'Erişilebilir nokta ana rotanın sağında bulunuyor ve tekerlekli sandalye için daha uygun';
+      case 'sol':
+        return 'Erişilebilir nokta ana rotanın solunda bulunuyor ve tekerlekli sandalye için daha uygun';
+      case 'düz':
+        return 'Erişilebilir nokta ana rota üzerinde veya çok yakınında bulunuyor';
+      default:
+        return 'Erişilebilir nokta rota planlaması için uygun konumda';
+    }
+  }
+
+  String _getWaypointType(LatLng waypoint) {
+    // Bu noktada gerçek uygulamada Firebase'den waypoint'in tipini alabiliriz
+    // Şimdilik genel bir tip döndürüyoruz
+    return 'erişilebilir_nokta';
+  }
+
+  Future<String> _getTurnReason(
+    LatLng from,
+    LatLng to,
+    LatLng? nextPoint,
+  ) async {
+    final bearing = _getBearing(from, to);
+    final turnDirection = _getTurnDirection(bearing);
+
+    // Eğer bir sonraki nokta varsa, dönüşün sebebini analiz et
+    if (nextPoint != null) {
+      // Yakındaki erişilebilir noktaları kontrol et
+      final nearbyAccessiblePoints = await _findNearbyAccessiblePoints(to, 100);
+
+      if (nearbyAccessiblePoints.isNotEmpty) {
+        final closestPoint = nearbyAccessiblePoints.first;
+        final pointType = _typeToLabel(closestPoint['type']);
+
+        if (turnDirection == 'sağa') {
+          return 'Sağa dönüş: $pointType erişilebilir noktasına ulaşmak için';
+        } else if (turnDirection == 'sola') {
+          return 'Sola dönüş: $pointType erişilebilir noktasına ulaşmak için';
+        } else {
+          return 'Düz devam: $pointType erişilebilir noktası yakınında';
+        }
+      }
+    }
+
+    // Genel dönüş sebepleri
+    switch (turnDirection) {
+      case 'sağa':
+        return 'Sağa dönüş: Tekerlekli sandalye için daha erişilebilir yol';
+      case 'sola':
+        return 'Sola dönüş: Tekerlekli sandalye için daha erişilebilir yol';
+      case 'geri':
+        return 'Geri dönüş: Rota optimizasyonu için';
+      default:
+        return 'Düz devam: Ana rota takibi';
+    }
+  }
+
+  String _getTurnDirection(double bearing) {
+    if (bearing >= 337.5 || bearing < 22.5) {
+      return 'düz';
+    } else if (bearing >= 22.5 && bearing < 67.5) {
+      return 'sağa';
+    } else if (bearing >= 67.5 && bearing < 112.5) {
+      return 'sağa';
+    } else if (bearing >= 112.5 && bearing < 157.5) {
+      return 'sağa';
+    } else if (bearing >= 157.5 && bearing < 202.5) {
+      return 'geri';
+    } else if (bearing >= 202.5 && bearing < 247.5) {
+      return 'sola';
+    } else if (bearing >= 247.5 && bearing < 292.5) {
+      return 'sola';
+    } else {
+      return 'sola';
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _findNearbyAccessiblePoints(
+    LatLng point,
+    double radius,
+  ) async {
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('markers')
+          .get();
+
+      List<Map<String, dynamic>> nearbyPoints = [];
+
+      for (final doc in snapshot.docs) {
+        final marker = MarkerModel.fromMap(doc.data());
+        final markerPoint = LatLng(marker.latitude, marker.longitude);
+
+        if (!_isAccessibleType(marker.type)) continue;
+
+        final distance = Geolocator.distanceBetween(
+          point.latitude,
+          point.longitude,
+          markerPoint.latitude,
+          markerPoint.longitude,
+        );
+
+        if (distance <= radius) {
+          nearbyPoints.add({
+            'type': marker.type,
+            'distance': distance,
+            'point': markerPoint,
+          });
+        }
+      }
+
+      // Mesafeye göre sırala
+      nearbyPoints.sort(
+        (a, b) => (a['distance'] as double).compareTo(b['distance'] as double),
+      );
+      return nearbyPoints;
+    } catch (e) {
+      print('Yakındaki noktalar bulunamadı: $e');
+      return [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _createNavigationSteps(
+    List<LatLng> routePoints,
+  ) async {
+    List<Map<String, dynamic>> steps = [];
+
+    if (routePoints.length < 2) return steps;
+
+    for (int i = 0; i < routePoints.length - 1; i++) {
+      final from = routePoints[i];
+      final to = routePoints[i + 1];
+      final nextPoint = i + 2 < routePoints.length ? routePoints[i + 2] : null;
+
+      final distance = Geolocator.distanceBetween(
+        from.latitude,
+        from.longitude,
+        to.latitude,
+        to.longitude,
+      );
+
+      final direction = _getDirection(from, to);
+      final turnReason = await _getTurnReason(from, to, nextPoint);
+      final turnDirection = _getTurnDirection(_getBearing(from, to));
+
+      steps.add({
+        'step': i + 1,
+        'from': from,
+        'to': to,
+        'distance': distance,
+        'direction': direction,
+        'turnDirection': turnDirection,
+        'reason': turnReason,
+        'isLast': i == routePoints.length - 2,
+      });
+    }
+
+    return steps;
+  }
+
   Future<void> drawRoute() async {
     if (startPoint == null || endPoint == null || _controller == null) {
       _showMessage('Başlangıç veya bitiş noktası eksik.');
       return;
     }
 
-    final points = await getRoute(startPoint!, endPoint!);
+    final routeData = await getRoute(startPoint!, endPoint!);
+    final points = routeData['route'] as List<LatLng>;
+    final waypoints = routeData['waypoints'] as List<RouteWaypoint>;
+
     if (points.isNotEmpty) {
+      // Navigasyon adımlarını oluştur
+      final steps = await _createNavigationSteps(points);
+
       setState(() {
         routePoints = points;
-        _hasAnnouncedRouteStart = false; // Reset for new route
-        _hasAnnouncedDestinationReached = false; // Reset for new route
-        _lastAnnouncedTurnIndex = null; // Reset turn announcements
-        _hasAnnouncedOffRoute = false; // Reset off-route flag
+        routeWaypoints = waypoints;
+        navigationSteps = steps;
       });
 
       await _clearAllRoutes();
+
       await _drawMainRoute(points);
+
       await _addStartEndMarkers();
 
       final bounds = _boundsFromLatLngList(points);
@@ -1147,8 +1261,6 @@ class _MapPageState extends State<MapPage> {
         );
       }
       await _announceRouteCreated();
-      await _announceNavigationStart();
-      _updateTurnBanner();
     } else {
       _showMessage(
         'Rota oluşturulamadı. Lütfen başka bir hedef seçin veya erişim noktası ekleyin.',
@@ -1347,13 +1459,13 @@ class _MapPageState extends State<MapPage> {
       startPoint = null;
       endPoint = null;
       routePoints.clear();
+      routeWaypoints.clear();
+      navigationSteps.clear();
       routeDistanceKm = null;
       routeDurationMin = null;
       isStartPointFixed = false;
-      _hasAnnouncedRouteStart = false; // Reset
-      _hasAnnouncedDestinationReached = false; // Reset
-      _lastAnnouncedTurnIndex = null; // Reset
-      _hasAnnouncedOffRoute = false; // Reset
+      isNavigationStarted = false;
+      currentStepIndex = 0;
     });
 
     final pos = await _getCurrentLocation();
@@ -1595,7 +1707,6 @@ class _MapPageState extends State<MapPage> {
                   : 'Sesli Yönlendirmeyi Aç',
             ),
           ),
-
           Container(
             margin: const EdgeInsets.only(right: 8),
             decoration: BoxDecoration(
@@ -1613,7 +1724,6 @@ class _MapPageState extends State<MapPage> {
       body: Stack(
         children: [
           maplibre.MaplibreMap(
-            compassEnabled: _compassEnabled,
             styleString: _styleUrl,
             initialCameraPosition: const maplibre.CameraPosition(
               target: maplibre.LatLng(38.7569, 30.5387),
@@ -1625,6 +1735,14 @@ class _MapPageState extends State<MapPage> {
             tiltGesturesEnabled: true,
             onMapLongClick: (point, latLng) async {
               if (_controller == null) return;
+
+              // Navigasyon başlatıldığında marker yerleştirmeyi devre dışı bırak
+              if (isNavigationStarted) {
+                _showMessage(
+                  'Navigasyon sırasında yeni nokta eklenemez. Önce navigasyonu sonlandırın.',
+                );
+                return;
+              }
 
               String? action = await showModalBottomSheet<String>(
                 context: context,
@@ -1776,157 +1894,406 @@ class _MapPageState extends State<MapPage> {
               }
             },
           ),
-          // UI Overlay
-          // === NAVİGASYON MODU UI ===
-          if (_isNavigating) ...[
-            // Üstte bant
+          // Navigation Step Card (Top)
+          if (isNavigationStarted && routePoints.isNotEmpty)
             Positioned(
-              top: 12,
-              left: 12,
-              right: 12,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 12,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(12),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.08),
-                      blurRadius: 10,
-                      offset: Offset(0, 4),
-                    ),
-                  ],
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.straighten, color: AppTheme.primaryBlue),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        _turnBannerText.isEmpty
-                            ? 'Yönlendirme hazır'
-                            : _turnBannerText,
-                        style: AppTheme.bodyLarge.copyWith(
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            // Altta bilgi + Sonlandır
-            Positioned(
-              left: 12,
-              right: 12,
-              bottom: 12,
+              top: 16,
+              left: 16,
+              right: 16,
               child: Container(
                 decoration: AppTheme.cardDecoration,
                 child: Padding(
                   padding: const EdgeInsets.all(16),
                   child: Row(
                     children: [
-                      Icon(Icons.route, color: AppTheme.primaryBlue),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          routeDistanceKm != null && routeDurationMin != null
-                              ? "${routeDistanceKm!.toStringAsFixed(2)} km • ${routeDurationMin!.toStringAsFixed(0)} dk"
-                              : "Rota bilgisi",
-                          style: AppTheme.bodyLarge.copyWith(
-                            fontWeight: FontWeight.bold,
-                          ),
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: AppTheme.primaryBlue.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Icon(
+                          Icons.navigation,
+                          color: AppTheme.primaryBlue,
+                          size: 24,
                         ),
                       ),
                       const SizedBox(width: 12),
-                      ElevatedButton.icon(
-                        onPressed: _stopNavigation,
-                        style: AppTheme.primaryButtonStyle.copyWith(
-                          backgroundColor: MaterialStateProperty.all(
-                            AppTheme.error,
-                          ),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              "Adım ${currentStepIndex + 1}/${navigationSteps.length}",
+                              style: AppTheme.bodySmall.copyWith(
+                                color: AppTheme.textSecondary,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            if (currentStepIndex < navigationSteps.length)
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    navigationSteps[currentStepIndex]['direction'],
+                                    style: AppTheme.bodyLarge.copyWith(
+                                      color: AppTheme.textPrimary,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    navigationSteps[currentStepIndex]['reason'],
+                                    style: AppTheme.bodySmall.copyWith(
+                                      color: AppTheme.textSecondary,
+                                      fontSize: 11,
+                                    ),
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ],
+                              )
+                            else
+                              Text(
+                                "Hedef noktaya ulaştınız!",
+                                style: AppTheme.bodyLarge.copyWith(
+                                  color: Colors.green.shade700,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                          ],
                         ),
-                        icon: const Icon(Icons.stop),
-                        label: const Text('Sonlandır'),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton(
+                        onPressed: () async {
+                          if (currentStepIndex < navigationSteps.length - 1) {
+                            setState(() {
+                              currentStepIndex++;
+                            });
+                            await _announceCurrentStep();
+                          }
+                        },
+                        icon: Icon(
+                          Icons.skip_next,
+                          color: AppTheme.primaryBlue,
+                        ),
+                        tooltip: 'Sonraki Adım',
                       ),
                     ],
                   ),
                 ),
               ),
             ),
-          ]
-          // === STANDART (navigasyon kapalı) UI ===
-          else ...[
-            // buraya senin mevcut Column içeriğini (Rota Bilgileri kartı, sayaç, filtreler, aksiyon butonları) BİREBİR bırak
-            Column(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                // Route Info Card
-                if (!_isNavigating &&
-                    routeDistanceKm != null &&
-                    routeDurationMin != null)
-                  Container(
-                    margin: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 8,
-                    ),
-                    decoration: AppTheme.cardDecoration,
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Row(
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: AppTheme.primaryBlue.withOpacity(0.1),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Icon(
-                              Icons.directions,
-                              color: AppTheme.primaryBlue,
-                              size: 24,
-                            ),
+          // UI Overlay
+          Column(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              // Route Info Card (only show when navigation is not started)
+              if (!isNavigationStarted &&
+                  routeDistanceKm != null &&
+                  routeDurationMin != null)
+                Container(
+                  margin: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
+                  decoration: AppTheme.cardDecoration,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: AppTheme.primaryBlue.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(8),
                           ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  "Rota Bilgileri",
-                                  style: AppTheme.bodySmall.copyWith(
-                                    color: AppTheme.textSecondary,
-                                    fontWeight: FontWeight.w500,
-                                  ),
+                          child: Icon(
+                            Icons.directions,
+                            color: AppTheme.primaryBlue,
+                            size: 24,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                "Rota Bilgileri",
+                                style: AppTheme.bodySmall.copyWith(
+                                  color: AppTheme.textSecondary,
+                                  fontWeight: FontWeight.w500,
                                 ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  "${routeDistanceKm!.toStringAsFixed(2)} km • ${routeDurationMin!.toStringAsFixed(0)} dk",
-                                  style: AppTheme.bodyLarge.copyWith(
-                                    color: AppTheme.textPrimary,
-                                    fontWeight: FontWeight.bold,
-                                  ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                "${routeDistanceKm!.toStringAsFixed(2)} km • ${routeDurationMin!.toStringAsFixed(0)} dk",
+                                style: AppTheme.bodyLarge.copyWith(
+                                  color: AppTheme.textPrimary,
+                                  fontWeight: FontWeight.bold,
                                 ),
-                              ],
+                              ),
+                            ],
+                          ),
+                        ),
+                        Container(
+                          decoration: BoxDecoration(
+                            gradient: AppTheme.primaryGradient,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Material(
+                            color: Colors.transparent,
+                            child: InkWell(
+                              onTap: startNavigation,
+                              borderRadius: BorderRadius.circular(12),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 8,
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.play_arrow,
+                                      color: Colors.white,
+                                      size: 20,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      'Başlat',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
                             ),
                           ),
-                          const SizedBox(width: 12),
-                          ElevatedButton.icon(
-                            onPressed: _startNavigation,
-                            style: AppTheme.primaryButtonStyle,
-                            icon: const Icon(Icons.play_arrow),
-                            label: const Text('Başlat'),
-                          ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
                   ),
+                ),
 
-                // Marker Count Info
+              // Navigation Control Buttons (only show when navigation is started)
+              if (isNavigationStarted)
+                Container(
+                  margin: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [
+                                Colors.red.shade600,
+                                Colors.red.shade800,
+                              ],
+                            ),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Material(
+                            color: Colors.transparent,
+                            child: InkWell(
+                              onTap: stopNavigation,
+                              borderRadius: BorderRadius.circular(12),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 12,
+                                ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      Icons.stop,
+                                      color: Colors.white,
+                                      size: 20,
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      'Sonlandır',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 16,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: AppTheme.primaryBlue,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Material(
+                            color: Colors.transparent,
+                            child: InkWell(
+                              onTap: () {
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (context) => RouteDetailsPage(
+                                      navigationSteps: navigationSteps,
+                                      routeWaypoints: routeWaypoints,
+                                      routeDistanceKm: routeDistanceKm,
+                                      routeDurationMin: routeDurationMin,
+                                    ),
+                                  ),
+                                );
+                              },
+                              borderRadius: BorderRadius.circular(12),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 12,
+                                ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      Icons.list_alt,
+                                      color: Colors.white,
+                                      size: 20,
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      'Rota Detayı',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 16,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+              // Navigation Info Card (only show when navigation is started)
+              if (isNavigationStarted)
+                Container(
+                  margin: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
+                  decoration: AppTheme.cardDecoration,
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: AppTheme.primaryBlue.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Icon(
+                            Icons.navigation,
+                            color: AppTheme.primaryBlue,
+                            size: 24,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                "Hedefe Kalan",
+                                style: AppTheme.bodySmall.copyWith(
+                                  color: AppTheme.textSecondary,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Row(
+                                children: [
+                                  Icon(
+                                    Icons.route,
+                                    size: 16,
+                                    color: AppTheme.textSecondary,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    _formatDistance(
+                                      _calculateRemainingDistance(),
+                                    ),
+                                    style: AppTheme.bodyLarge.copyWith(
+                                      color: AppTheme.textPrimary,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 16),
+                                  Icon(
+                                    Icons.timer,
+                                    size: 16,
+                                    color: AppTheme.textSecondary,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    _formatDuration(
+                                      _calculateRemainingDuration(),
+                                    ),
+                                    style: AppTheme.bodyLarge.copyWith(
+                                      color: AppTheme.textPrimary,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AppTheme.primaryBlue.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            '${currentStepIndex + 1}/${navigationSteps.length}',
+                            style: AppTheme.bodySmall.copyWith(
+                              color: AppTheme.primaryBlue,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+              // Marker Count Info (only show when navigation is not started)
+              if (!isNavigationStarted)
                 Container(
                   margin: const EdgeInsets.symmetric(
                     horizontal: 16,
@@ -1978,7 +2345,8 @@ class _MapPageState extends State<MapPage> {
                   ),
                 ),
 
-                // Filter Controls
+              // Filter Controls (only show when navigation is not started)
+              if (!isNavigationStarted)
                 Container(
                   margin: const EdgeInsets.symmetric(
                     horizontal: 16,
@@ -1997,7 +2365,8 @@ class _MapPageState extends State<MapPage> {
                   ),
                 ),
 
-                // Action Buttons
+              // Action Buttons (only show when navigation is not started)
+              if (!isNavigationStarted)
                 Container(
                   margin: const EdgeInsets.symmetric(
                     horizontal: 16,
@@ -2191,45 +2560,14 @@ class _MapPageState extends State<MapPage> {
                     ],
                   ),
                 ),
-              ],
-            ),
-          ],
+            ],
+          ),
         ],
       ),
     );
   }
 
   // Helper methods for improved UI
-  Widget _buildActionTile({
-    required IconData icon,
-    required String title,
-    required String subtitle,
-    required Color color,
-    required VoidCallback onTap,
-  }) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      decoration: AppTheme.cardDecorationLight,
-      child: ListTile(
-        leading: Container(
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
-            color: color.withOpacity(0.1),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Icon(icon, color: color, size: 24),
-        ),
-        title: Text(title, style: AppTheme.bodyLarge),
-        subtitle: Text(subtitle, style: AppTheme.bodySmall),
-        onTap: onTap,
-        trailing: Icon(
-          Icons.arrow_forward_ios,
-          color: AppTheme.textLight,
-          size: 16,
-        ),
-      ),
-    );
-  }
 
   Widget _buildMarkerTypeTile({
     required IconData icon,
@@ -2701,4 +3039,22 @@ class LatLng {
 
   @override
   int get hashCode => latitude.hashCode ^ longitude.hashCode;
+}
+
+class RouteWaypoint {
+  final LatLng location;
+  final String type; // 'rampa', 'asansör', etc.
+  final String direction; // 'sağ', 'sol', 'düz'
+  final String reason; // Neden bu yön tercih edildi
+  final double distanceFromStart;
+  final double distanceToEnd;
+
+  RouteWaypoint({
+    required this.location,
+    required this.type,
+    required this.direction,
+    required this.reason,
+    required this.distanceFromStart,
+    required this.distanceToEnd,
+  });
 }
