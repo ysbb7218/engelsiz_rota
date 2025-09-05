@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
@@ -47,6 +48,33 @@ class _MapPageState extends State<MapPage> {
 
   // Erişilebilir nokta sayısını takip etmek için
   int _totalAccessiblePoints = 0;
+
+  // Icon boyutunu hesapla (sabit boyut)
+  double _getIconSize() {
+    return 0.2; // Sabit küçük boyut
+  }
+
+  // Custom icon'ları yükle
+  Future<void> _loadCustomIcons() async {
+    if (_controller == null) return;
+
+    try {
+      // MapLibre GL'de custom icon yükleme
+      final imageData = await _loadImageFromAssets('assets/konumum.png');
+      await _controller!.addImage('konumum', imageData);
+      print('Konumum icon başarıyla yüklendi');
+    } catch (e) {
+      print('Custom icon yüklenirken hata: $e');
+      // Hata durumunda built-in icon kullan
+      print('Built-in icon kullanılacak');
+    }
+  }
+
+  // Asset'ten resim yükle
+  Future<Uint8List> _loadImageFromAssets(String assetPath) async {
+    final ByteData data = await rootBundle.load(assetPath);
+    return data.buffer.asUint8List();
+  }
 
   // Rota dışında olduğunu duyurmak için
   bool _hasAnnouncedOffRoute = false;
@@ -318,6 +346,11 @@ class _MapPageState extends State<MapPage> {
   void _onMapCreated(maplibre.MaplibreMapController controller) {
     _controller = controller;
 
+    // Harita yüklendikten sonra icon'ları yükle
+    Future.delayed(const Duration(milliseconds: 1000), () {
+      _loadCustomIcons();
+    });
+
     // Symbol tap olayını bir kez tanımla
     _controller!.onSymbolTapped.add((symbol) {
       print('=== Sembol tıklandı: ${symbol.id} ==='); // Hata ayıklama için log
@@ -405,24 +438,42 @@ class _MapPageState extends State<MapPage> {
 
     // Eğer konum marker'ı yoksa oluştur, varsa güncelle
     if (_currentLocationSymbol == null) {
+      final iconSize = _getIconSize();
       final symbol = await _controller!.addSymbol(
         maplibre.SymbolOptions(
           geometry: maplibre.LatLng(pos.latitude, pos.longitude),
-          textField: 'Konumum',
-          textSize: 14.0,
+          iconImage: 'konumum', // Custom icon
+          iconSize: iconSize,
+          iconColor: '#00FF00',
+          iconHaloColor: '#FFFFFF',
+          iconHaloWidth: 2.0,
+          // Fallback olarak text de ekleyelim
+          textField: '📍',
+          textSize: 20.0,
           textColor: '#00FF00',
           textHaloColor: '#FFFFFF',
           textHaloWidth: 2.0,
-          iconImage: null,
         ),
       );
       _currentLocationSymbol = symbol;
     } else {
       try {
+        final iconSize = _getIconSize();
         await _controller!.updateSymbol(
           _currentLocationSymbol!,
           maplibre.SymbolOptions(
             geometry: maplibre.LatLng(pos.latitude, pos.longitude),
+            iconImage: 'konumum', // Custom icon
+            iconSize: iconSize,
+            iconColor: '#00FF00',
+            iconHaloColor: '#FFFFFF',
+            iconHaloWidth: 2.0,
+            // Fallback olarak text de ekleyelim
+            textField: '📍',
+            textSize: 20.0,
+            textColor: '#00FF00',
+            textHaloColor: '#FFFFFF',
+            textHaloWidth: 2.0,
           ),
         );
       } catch (e) {
@@ -1357,19 +1408,21 @@ class _MapPageState extends State<MapPage> {
   Future<void> _addStartEndMarkers() async {
     if (startPoint == null || endPoint == null || _controller == null) return;
 
+    final iconSize = _getIconSize();
     final startSymbol = await _controller!.addSymbol(
       maplibre.SymbolOptions(
         geometry: maplibre.LatLng(startPoint!.latitude, startPoint!.longitude),
-        iconImage: 'marker-15',
-        iconSize: 3.0,
+        iconImage: 'konumum', // Custom icon
+        iconSize: iconSize,
         iconColor: '#4CAF50',
         iconHaloColor: '#FFFFFF',
         iconHaloWidth: 2.0,
-        textField: 'Konumum',
-        textSize: 12.0,
-        textColor: '#FFFFFF',
-        textHaloColor: '#000000',
-        textHaloWidth: 1.0,
+        // Fallback olarak text de ekleyelim
+        textField: '📍',
+        textSize: 20.0,
+        textColor: '#4CAF50',
+        textHaloColor: '#FFFFFF',
+        textHaloWidth: 2.0,
       ),
     );
     _routeSymbols.add(startSymbol);
