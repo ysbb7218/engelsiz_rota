@@ -20,7 +20,7 @@ class MapPage extends StatefulWidget {
   State<MapPage> createState() => _MapPageState();
 }
 
-class _MapPageState extends State<MapPage> {
+class _MapPageState extends State<MapPage> with WidgetsBindingObserver {
   static const String _mapTilerKey = 'RUlFyEFNM0RNo0FrC3ch';
   static const String _orsApiKey =
       'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjQ4MGE1MzhlMWIwNTRiOGZiOTE5YTg3M2NmYzQ3MzJjIiwiaCI6Im11cm11cjY0In0=';
@@ -126,18 +126,21 @@ class _MapPageState extends State<MapPage> {
     _initializeTTS();
     _listenFirestoreMarkers();
 
-    // Harita açıldığında Afyon koordinatlarında başla, konum güncellemeye devam et ama kamerayı otomatik ışınlama
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      // _setInitialLocation(); // Bu çağrıyı kaldırdık, kamerayı Afyon'da bırak
-    });
+    // WidgetsBindingObserver'ı ekle
+    WidgetsBinding.instance.addObserver(this);
 
+    // İlk konum güncellemesini başlat
+    _startLocationUpdates();
+  }
+
+  // Konum güncellemelerini başlatan fonksiyon
+  void _startLocationUpdates() {
     locationTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
       if (!isStartPointFixed) {
         // Sadece başlangıç noktası sabit değilse güncelle
         final pos = await _getCurrentLocation();
         if (pos != null) {
           updateCurrentLocationMarker(pos);
-          // Sadece navigasyon başladığında sesli uyarıları kontrol et
           if (isNavigationStarted) {
             await _announceRouteProgress();
             await _checkOffRoute();
@@ -164,6 +167,24 @@ class _MapPageState extends State<MapPage> {
         }
       }
     });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      // Uygulama arka plana geçtiğinde veya inaktif olduğunda
+      print('Uygulama arka plana geçti, konum güncellemeleri durduruluyor.');
+      locationTimer?.cancel();
+      locationTimer = null;
+    } else if (state == AppLifecycleState.resumed) {
+      // Uygulama ön plana geldiğinde
+      print('Uygulama ön plana geldi, konum güncellemeleri başlatılıyor.');
+      if (locationTimer == null) {
+        _startLocationUpdates();
+      }
+    }
   }
 
   // TTS initialization
@@ -340,6 +361,8 @@ class _MapPageState extends State<MapPage> {
 
   @override
   void dispose() {
+    // WidgetsBindingObserver'ı kaldır
+    WidgetsBinding.instance.removeObserver(this);
     _markerSub?.cancel();
     locationTimer?.cancel();
     _controller?.dispose();
