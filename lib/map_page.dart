@@ -102,6 +102,10 @@ class _MapPageState extends State<MapPage> {
   bool isNavigationStarted = false; // Navigasyon başlatıldı mı?
   int currentStepIndex = 0; // Mevcut adım indeksi
 
+  // Alternative routes
+  List<Map<String, dynamic>> alternativeRoutes = []; // Alternatif rotalar
+  int selectedRouteIndex = 0; // Seçili rota indeksi
+
   // Erişilebilir nokta türlerini tanımla
   List<String> get _accessibleTypes => [
     'rampa', // Ramp
@@ -646,6 +650,7 @@ class _MapPageState extends State<MapPage> {
     print('♿ Profil: $selectedProfile');
 
     try {
+      // First, create a simple route quickly for immediate display
       List<LatLng> accessiblePoints = await _findAccessiblePoints(start, end);
       print('♿ ${accessiblePoints.length} erişilebilir nokta bulundu');
 
@@ -656,7 +661,7 @@ class _MapPageState extends State<MapPage> {
       );
       print('🔄 ${selectedWaypoints.length} waypoint seçildi');
 
-      // Waypoint'leri LatLng listesine çevir
+      // Create the main route immediately
       List<LatLng> waypointLocations = selectedWaypoints
           .map((wp) => wp.location)
           .toList();
@@ -668,7 +673,19 @@ class _MapPageState extends State<MapPage> {
       );
 
       if (route.isNotEmpty) {
-        print('✅ Rota başarıyla oluşturuldu: ${route.length} nokta');
+        print('✅ Ana rota başarıyla oluşturuldu: ${route.length} nokta');
+
+        // Set the main route immediately
+        setState(() {
+          routePoints = route;
+          routeWaypoints = selectedWaypoints;
+          routeDistanceKm = routeDistanceKm;
+          routeDurationMin = routeDurationMin;
+        });
+
+        // Calculate alternative routes in background
+        _calculateAlternativeRoutesInBackground(start, end);
+
         return {'route': route, 'waypoints': selectedWaypoints};
       } else {
         print('⚠️ Rota oluşturulamadı, düz rota deneniyor');
@@ -679,6 +696,263 @@ class _MapPageState extends State<MapPage> {
       print('❌ Rota oluşturma hatası: $e');
       final directRoute = await _createDirectRoute(start, end);
       return {'route': directRoute, 'waypoints': <RouteWaypoint>[]};
+    }
+  }
+
+  void _calculateAlternativeRoutesInBackground(LatLng start, LatLng end) async {
+    try {
+      print('🔄 Arka planda alternatif rotalar hesaplanıyor...');
+
+      // Start with current route as the first alternative
+      alternativeRoutes = [
+        {
+          'route': routePoints,
+          'waypoints': routeWaypoints,
+          'distance': routeDistanceKm ?? 0.0,
+          'duration': routeDurationMin ?? 0.0,
+          'type': 'current',
+          'description': 'Mevcut rota',
+        },
+      ];
+
+      // Update UI immediately with current route
+      if (mounted) {
+        setState(() {
+          selectedRouteIndex = 0;
+        });
+      }
+
+      // Calculate only essential alternative routes quickly
+      await _calculateQuickAlternativeRoutes(start, end);
+
+      // Calculate remaining routes in background
+      _calculateRemainingRoutesInBackground(start, end);
+    } catch (e) {
+      print('❌ Alternatif rota hesaplama hatası: $e');
+    }
+  }
+
+  Future<void> _calculateQuickAlternativeRoutes(
+    LatLng start,
+    LatLng end,
+  ) async {
+    try {
+      // Only calculate direct route and one waypoint route quickly
+      List<Map<String, dynamic>> quickRoutes = [];
+
+      // 1. Direct route (fastest to calculate)
+      try {
+        final directRoute = await _createDirectRoute(start, end);
+        if (directRoute.isNotEmpty) {
+          quickRoutes.add({
+            'route': directRoute,
+            'waypoints': <RouteWaypoint>[],
+            'distance': routeDistanceKm ?? 0.0,
+            'duration': routeDurationMin ?? 0.0,
+            'type': 'direct',
+            'description': 'Düz rota',
+          });
+        }
+      } catch (e) {
+        print('⚠️ Düz rota hatası: $e');
+      }
+
+      // 2. One waypoint route (if accessible points exist)
+      try {
+        List<LatLng> accessiblePoints = await _findAccessiblePoints(start, end);
+        if (accessiblePoints.isNotEmpty) {
+          List<RouteWaypoint> selectedWaypoints = _selectBestWaypoints(
+            start,
+            end,
+            accessiblePoints,
+          );
+
+          if (selectedWaypoints.isNotEmpty) {
+            // Take only the first waypoint for quick calculation
+            List<RouteWaypoint> singleWaypoint = selectedWaypoints
+                .take(1)
+                .toList();
+            List<LatLng> waypointLocations = singleWaypoint
+                .map((wp) => wp.location)
+                .toList();
+
+            List<LatLng> route = await _createSimpleRoute(
+              start,
+              end,
+              waypointLocations,
+            );
+
+            if (route.isNotEmpty) {
+              quickRoutes.add({
+                'route': route,
+                'waypoints': singleWaypoint,
+                'distance': routeDistanceKm ?? 0.0,
+                'duration': routeDurationMin ?? 0.0,
+                'type': 'waypoints',
+                'description': '1 erişilebilir nokta ile',
+              });
+            }
+          }
+        }
+      } catch (e) {
+        print('⚠️ Waypoint rota hatası: $e');
+      }
+
+      // Add quick routes to alternatives
+      alternativeRoutes.addAll(quickRoutes);
+
+      // Sort by accessibility score
+      alternativeRoutes.sort((a, b) {
+        double scoreA = _calculateRouteAccessibilityScore(a);
+        double scoreB = _calculateRouteAccessibilityScore(b);
+        return scoreB.compareTo(scoreA);
+      });
+
+      print('🛣️ ${alternativeRoutes.length} hızlı alternatif rota hesaplandı');
+
+      // Update UI with quick routes
+      if (mounted) {
+        setState(() {
+          selectedRouteIndex = 0;
+        });
+      }
+    } catch (e) {
+      print('❌ Hızlı alternatif rota hesaplama hatası: $e');
+    }
+  }
+
+  void _calculateRemainingRoutesInBackground(LatLng start, LatLng end) async {
+    try {
+      print('🔄 Kalan rotalar arka planda hesaplanıyor...');
+
+      // Calculate remaining routes
+      final additionalRoutes = await _calculateAlternativeRoutes(start, end);
+
+      // Add to existing routes
+      alternativeRoutes.addAll(additionalRoutes);
+
+      // Sort by accessibility score
+      alternativeRoutes.sort((a, b) {
+        double scoreA = _calculateRouteAccessibilityScore(a);
+        double scoreB = _calculateRouteAccessibilityScore(b);
+        return scoreB.compareTo(scoreA);
+      });
+
+      print(
+        '🛣️ Toplam ${alternativeRoutes.length} alternatif rota hesaplandı',
+      );
+
+      // Update UI with all routes
+      if (mounted) {
+        setState(() {
+          selectedRouteIndex = 0;
+        });
+      }
+    } catch (e) {
+      print('❌ Kalan rota hesaplama hatası: $e');
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _calculateAlternativeRoutes(
+    LatLng start,
+    LatLng end,
+  ) async {
+    List<Map<String, dynamic>> routes = [];
+
+    try {
+      // Only calculate additional waypoint combinations (2-3 waypoints)
+      List<LatLng> accessiblePoints = await _findAccessiblePoints(start, end);
+      if (accessiblePoints.isNotEmpty) {
+        // Try 2-3 waypoint combinations only
+        for (
+          int waypointCount = 2;
+          waypointCount <= 3 && waypointCount <= accessiblePoints.length;
+          waypointCount++
+        ) {
+          List<RouteWaypoint> selectedWaypoints = _selectBestWaypoints(
+            start,
+            end,
+            accessiblePoints,
+          );
+
+          // Take only the specified number of waypoints
+          selectedWaypoints = selectedWaypoints.take(waypointCount).toList();
+
+          if (selectedWaypoints.isNotEmpty) {
+            List<LatLng> waypointLocations = selectedWaypoints
+                .map((wp) => wp.location)
+                .toList();
+
+            List<LatLng> route = await _createSimpleRoute(
+              start,
+              end,
+              waypointLocations,
+            );
+
+            if (route.isNotEmpty) {
+              routes.add({
+                'route': route,
+                'waypoints': selectedWaypoints,
+                'distance': routeDistanceKm ?? 0.0,
+                'duration': routeDurationMin ?? 0.0,
+                'type': 'waypoints',
+                'description': '${waypointCount} erişilebilir nokta ile',
+              });
+            }
+          }
+        }
+      }
+
+      // Calculate preference-based routes (fastest, shortest)
+      final preferences = ['fastest', 'shortest'];
+      for (String preference in preferences) {
+        try {
+          final String url =
+              'https://api.openrouteservice.org/v2/directions/$selectedProfile/geojson';
+          final response = await http.post(
+            Uri.parse(url),
+            headers: {
+              'Authorization': _orsApiKey,
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({
+              'coordinates': [
+                [start.longitude, start.latitude],
+                [end.longitude, end.latitude],
+              ],
+              'elevation': false,
+              'preference': preference,
+              'continue_straight': true,
+            }),
+          );
+
+          if (response.statusCode == 200) {
+            final data = jsonDecode(response.body);
+            final coords =
+                data['features'][0]['geometry']['coordinates'] as List;
+            final props = data['features'][0]['properties']['summary'];
+
+            routes.add({
+              'route': coords.map((c) => LatLng(c[1], c[0])).toList(),
+              'waypoints': <RouteWaypoint>[],
+              'distance': props['distance'] / 1000,
+              'duration': props['duration'] / 60,
+              'type': preference,
+              'description': preference == 'fastest'
+                  ? 'En hızlı rota'
+                  : 'En kısa rota',
+            });
+          }
+        } catch (e) {
+          print('⚠️ $preference rota hatası: $e');
+        }
+      }
+
+      print('🛣️ ${routes.length} ek alternatif rota hesaplandı');
+      return routes;
+    } catch (e) {
+      print('❌ Alternatif rota hesaplama hatası: $e');
+      return [];
     }
   }
 
@@ -1311,6 +1585,51 @@ class _MapPageState extends State<MapPage> {
     }
   }
 
+  Future<void> switchToRoute(int routeIndex) async {
+    if (routeIndex < 0 || routeIndex >= alternativeRoutes.length) return;
+
+    final selectedRoute = alternativeRoutes[routeIndex];
+    final points = selectedRoute['route'] as List<LatLng>;
+    final waypoints = selectedRoute['waypoints'] as List<RouteWaypoint>;
+
+    if (points.isNotEmpty) {
+      // Navigasyon adımlarını oluştur
+      final steps = await _createNavigationSteps(points);
+
+      setState(() {
+        selectedRouteIndex = routeIndex;
+        routePoints = points;
+        routeWaypoints = waypoints;
+        routeDistanceKm = selectedRoute['distance'] as double;
+        routeDurationMin = selectedRoute['duration'] as double;
+        navigationSteps = steps;
+
+        // TTS tekrar kontrol resetleri
+        _routeCreatedAnnounced = false;
+        _announcedTurnSteps.clear();
+        _hasAnnouncedDestinationReached = false;
+      });
+
+      await _clearAllRoutes();
+      await _drawMainRoute(points);
+
+      final bounds = _boundsFromLatLngList(points);
+      if (bounds != null) {
+        await _controller!.animateCamera(
+          maplibre.CameraUpdate.newLatLngBounds(
+            bounds,
+            left: 40,
+            top: 40,
+            right: 40,
+            bottom: 40,
+          ),
+        );
+      }
+
+      _showMessage('Rota değiştirildi: ${selectedRoute['description']}');
+    }
+  }
+
   Future<void> _clearAllRoutes() async {
     if (_routeLine != null) {
       try {
@@ -1339,6 +1658,100 @@ class _MapPageState extends State<MapPage> {
       } catch (_) {}
     }
     _routeSymbols.clear();
+  }
+
+  Future<Map<String, dynamic>> _snapToRoad(LatLng point) async {
+    try {
+      final String url =
+          'https://api.openrouteservice.org/v2/directions/$selectedProfile/geojson';
+
+      final response = await http.post(
+        Uri.parse(url),
+        headers: {
+          'Authorization': _orsApiKey,
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'coordinates': [
+            [point.longitude, point.latitude],
+            [
+              point.longitude,
+              point.latitude,
+            ], // Aynı noktayı iki kez gönderiyoruz
+          ],
+          'elevation': false,
+          'preference': 'fastest',
+          'radiuses': [
+            50,
+          ], // 50 metre yarıçapında yol arar (snap için daha geniş)
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final coords = data['features'][0]['geometry']['coordinates'] as List;
+
+        if (coords.isNotEmpty) {
+          final snappedPoint = LatLng(coords[0][1], coords[0][0]);
+          final distance = Geolocator.distanceBetween(
+            point.latitude,
+            point.longitude,
+            snappedPoint.latitude,
+            snappedPoint.longitude,
+          );
+
+          print('📍 Orijinal nokta: ${point.latitude}, ${point.longitude}');
+          print(
+            '🛣️ Snap edilen nokta: ${snappedPoint.latitude}, ${snappedPoint.longitude}',
+          );
+          print('📏 Mesafe: ${distance.toStringAsFixed(2)} metre');
+
+          return {
+            'success': true,
+            'originalPoint': point,
+            'snappedPoint': snappedPoint,
+            'distance': distance,
+            'isOnRoad': distance <= 2,
+          };
+        } else {
+          print('⚠️ API yanıtı boş koordinatlar içeriyor');
+          return {
+            'success': false,
+            'originalPoint': point,
+            'snappedPoint': point,
+            'distance': 0,
+            'isOnRoad': false,
+            'error': 'API yanıtı boş koordinatlar içeriyor',
+          };
+        }
+      } else {
+        print('⚠️ ORS API hatası: ${response.statusCode}, ${response.body}');
+        return {
+          'success': false,
+          'originalPoint': point,
+          'snappedPoint': point,
+          'distance': 0,
+          'isOnRoad': false,
+          'error': 'ORS API hatası: ${response.statusCode}',
+        };
+      }
+    } catch (e) {
+      print('❌ Snap to road hatası: $e');
+      return {
+        'success': false,
+        'originalPoint': point,
+        'snappedPoint': point,
+        'distance': 0,
+        'isOnRoad': false,
+        'error': 'Snap to road hatası: $e',
+      };
+    }
+  }
+
+  // Geriye uyumluluk için eski fonksiyon
+  Future<bool> _isPointOnRoad(LatLng point) async {
+    final result = await _snapToRoad(point);
+    return result['isOnRoad'] as bool;
   }
 
   Future<void> _drawMainRoute(List<LatLng> points) async {
@@ -1475,6 +1888,9 @@ class _MapPageState extends State<MapPage> {
       _routeCreatedAnnounced = false;
       _announcedTurnSteps.clear();
       _hasAnnouncedDestinationReached = false;
+      // Clear alternative routes
+      alternativeRoutes.clear();
+      selectedRouteIndex = 0;
     });
 
     final pos = await _getCurrentLocation();
@@ -1502,6 +1918,262 @@ class _MapPageState extends State<MapPage> {
   void _showMessage(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  void _showRouteSelectionDialog() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: AppTheme.backgroundWhite,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Handle bar
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 20),
+                  decoration: BoxDecoration(
+                    color: AppTheme.textLight,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              // Title
+              Row(
+                children: [
+                  Icon(Icons.alt_route, color: AppTheme.primaryBlue, size: 24),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Rota Seçin',
+                    style: AppTheme.headingMedium.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              // Route list
+              Expanded(
+                child: ListView.builder(
+                  itemCount: alternativeRoutes.length,
+                  itemBuilder: (context, index) {
+                    final route = alternativeRoutes[index];
+                    final isSelected = index == selectedRouteIndex;
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      decoration: BoxDecoration(
+                        color: isSelected
+                            ? AppTheme.primaryBlue.withOpacity(0.1)
+                            : AppTheme.backgroundLight,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: isSelected
+                              ? AppTheme.primaryBlue
+                              : Colors.grey.shade300,
+                          width: isSelected ? 2 : 1,
+                        ),
+                      ),
+                      child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: () {
+                            switchToRoute(index);
+                            Navigator.pop(context);
+                          },
+                          borderRadius: BorderRadius.circular(12),
+                          child: Padding(
+                            padding: const EdgeInsets.all(16),
+                            child: Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(8),
+                                  decoration: BoxDecoration(
+                                    color: isSelected
+                                        ? AppTheme.primaryBlue
+                                        : AppTheme.primaryBlue.withOpacity(0.1),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Icon(
+                                    _getRouteIcon(route['type'] as String),
+                                    color: isSelected
+                                        ? Colors.white
+                                        : AppTheme.primaryBlue,
+                                    size: 20,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        route['description'] as String,
+                                        style: AppTheme.bodyLarge.copyWith(
+                                          fontWeight: FontWeight.w600,
+                                          color: isSelected
+                                              ? AppTheme.primaryBlue
+                                              : AppTheme.textPrimary,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            Icons.route,
+                                            size: 16,
+                                            color: AppTheme.textSecondary,
+                                          ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            '${(route['distance'] as double).toStringAsFixed(1)} km',
+                                            style: AppTheme.bodyMedium.copyWith(
+                                              color: AppTheme.textSecondary,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 16),
+                                          Icon(
+                                            Icons.timer,
+                                            size: 16,
+                                            color: AppTheme.textSecondary,
+                                          ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            '${(route['duration'] as double).toStringAsFixed(0)} dk',
+                                            style: AppTheme.bodyMedium.copyWith(
+                                              color: AppTheme.textSecondary,
+                                              fontWeight: FontWeight.w500,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            Icons.accessible,
+                                            size: 16,
+                                            color: AppTheme.primaryBlue,
+                                          ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            'Erişilebilirlik: ${_calculateRouteAccessibilityScore(route).toStringAsFixed(0)}',
+                                            style: AppTheme.bodySmall.copyWith(
+                                              color: AppTheme.primaryBlue,
+                                              fontWeight: FontWeight.w600,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                if (isSelected)
+                                  Icon(
+                                    Icons.check_circle,
+                                    color: AppTheme.primaryBlue,
+                                    size: 24,
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  double _calculateRouteAccessibilityScore(Map<String, dynamic> route) {
+    double score = 0.0;
+
+    // 1. Waypoint sayısı skoru (daha fazla erişilebilir nokta = daha yüksek skor)
+    final waypoints = route['waypoints'] as List<RouteWaypoint>;
+    score += waypoints.length * 20; // Her waypoint için 20 puan
+
+    // 2. Rota türü skoru
+    final routeType = route['type'] as String;
+    switch (routeType) {
+      case 'waypoints':
+        score += 50; // En yüksek skor - erişilebilir noktalar içeriyor
+        break;
+      case 'direct':
+        score += 30; // Orta skor - düz rota
+        break;
+      case 'fastest':
+        score += 10; // Düşük skor - hız odaklı
+        break;
+      case 'shortest':
+        score += 20; // Orta skor - mesafe odaklı
+        break;
+      default:
+        score += 15;
+    }
+
+    // 3. Mesafe skoru (çok kısa rotalar erişilebilirlik açısından daha az tercih edilir)
+    final distance = route['distance'] as double;
+    if (distance < 0.5) {
+      score += 5; // Çok kısa rotalar
+    } else if (distance < 2.0) {
+      score += 15; // Kısa rotalar
+    } else if (distance < 5.0) {
+      score += 25; // Orta rotalar
+    } else {
+      score += 10; // Uzun rotalar
+    }
+
+    // 4. Süre skoru (çok hızlı rotalar erişilebilirlik açısından daha az tercih edilir)
+    final duration = route['duration'] as double;
+    if (duration < 5) {
+      score += 5; // Çok hızlı rotalar
+    } else if (duration < 15) {
+      score += 15; // Hızlı rotalar
+    } else if (duration < 30) {
+      score += 25; // Orta süreli rotalar
+    } else {
+      score += 10; // Uzun süreli rotalar
+    }
+
+    // 5. Erişilebilir nokta türü çeşitliliği
+    final Set<String> waypointTypes = waypoints.map((wp) => wp.type).toSet();
+    score += waypointTypes.length * 10; // Her farklı tür için 10 puan
+
+    print(
+      '🔍 Rota erişilebilirlik skoru: ${score.toStringAsFixed(1)} (${route['description']})',
+    );
+
+    return score;
+  }
+
+  IconData _getRouteIcon(String routeType) {
+    switch (routeType) {
+      case 'current':
+        return Icons.my_location;
+      case 'direct':
+        return Icons.straight;
+      case 'waypoints':
+        return Icons.accessible;
+      case 'fastest':
+        return Icons.speed;
+      case 'shortest':
+        return Icons.short_text;
+      default:
+        return Icons.route;
+    }
   }
 
   IconData _getIcon(String type) {
@@ -1739,7 +2411,7 @@ class _MapPageState extends State<MapPage> {
             onMapLongClick: (point, latLng) async {
               if (_controller == null) return;
 
-              // Navigasyon başlatıldığında marker yerleştirmeyi devre dışı bırak
+              // Navigasyon aktifken marker eklemeyi engelle
               if (isNavigationStarted) {
                 _showMessage(
                   'Navigasyon sırasında yeni nokta eklenemez. Önce navigasyonu sonlandırın.',
@@ -1835,6 +2507,41 @@ class _MapPageState extends State<MapPage> {
                 await drawRoute();
                 await _announceNavigationStart();
               } else if (action == 'marker') {
+                // Önce noktanın yol üzerinde olup olmadığını kontrol et
+                final isOnRoad = await _isPointOnRoad(
+                  LatLng(latLng.latitude, latLng.longitude),
+                );
+
+                LatLng finalPoint = LatLng(latLng.latitude, latLng.longitude);
+
+                if (!isOnRoad) {
+                  // Yolda değilse snap to road dene
+                  final snapResult = await _snapToRoad(
+                    LatLng(latLng.latitude, latLng.longitude),
+                  );
+
+                  if (snapResult['success']) {
+                    final snappedPoint = snapResult['snappedPoint'] as LatLng;
+                    final distance = snapResult['distance'] as double;
+
+                    // Sadece küçük taşma miktarlarında (10 metre altı) snap yap
+                    if (distance <= 10) {
+                      finalPoint = snappedPoint;
+                      _showMessage(
+                        'Konum en yakın yola ${distance.toStringAsFixed(1)} metre mesafeye taşındı.',
+                      );
+                    } else {
+                      // Çok uzaksa "yolda değilsin" mesajı göster
+                      _showMessage('Lütfen yola ekleyin');
+                      return;
+                    }
+                  } else {
+                    // Snap başarısızsa "yolda değilsin" mesajı göster
+                    _showMessage('Lütfen yola ekleyin');
+                    return;
+                  }
+                }
+
                 String? selectedType = await showModalBottomSheet<String>(
                   context: context,
                   backgroundColor: AppTheme.backgroundWhite,
@@ -1961,8 +2668,10 @@ class _MapPageState extends State<MapPage> {
                         .add(
                           MarkerModel(
                             type: selectedType,
-                            latitude: latLng.latitude,
-                            longitude: latLng.longitude,
+                            latitude: finalPoint
+                                .latitude, // Final koordinatlar (snap edilmiş veya orijinal)
+                            longitude: finalPoint
+                                .longitude, // Final koordinatlar (snap edilmiş veya orijinal)
                             description: description,
                             likes: 0,
                             createdAt: DateTime.now(),
@@ -2114,81 +2823,235 @@ class _MapPageState extends State<MapPage> {
                         ),
                         child: Padding(
                           padding: const EdgeInsets.all(16),
-                          child: Row(
+                          child: Column(
                             children: [
-                              Container(
-                                padding: const EdgeInsets.all(8),
-                                decoration: BoxDecoration(
-                                  color: AppTheme.primaryBlue.withOpacity(0.1),
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                                child: Icon(
-                                  Icons.directions,
-                                  color: AppTheme.primaryBlue,
-                                  size: 24,
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      "Rota Bilgileri",
-                                      style: AppTheme.bodySmall.copyWith(
-                                        color: AppTheme.textSecondary,
-                                        fontWeight: FontWeight.w500,
+                              Row(
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.all(8),
+                                    decoration: BoxDecoration(
+                                      color: AppTheme.primaryBlue.withOpacity(
+                                        0.1,
+                                      ),
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Icon(
+                                      Icons.directions,
+                                      color: AppTheme.primaryBlue,
+                                      size: 24,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          "Rota Bilgileri",
+                                          style: AppTheme.bodySmall.copyWith(
+                                            color: AppTheme.textSecondary,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          "${routeDistanceKm!.toStringAsFixed(2)} km • ${routeDurationMin!.toStringAsFixed(0)} dk",
+                                          style: AppTheme.bodyLarge.copyWith(
+                                            color: AppTheme.textPrimary,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  Container(
+                                    decoration: BoxDecoration(
+                                      gradient: AppTheme.primaryGradient,
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                    child: Material(
+                                      color: Colors.transparent,
+                                      child: InkWell(
+                                        onTap: startNavigation,
+                                        borderRadius: BorderRadius.circular(12),
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 16,
+                                            vertical: 8,
+                                          ),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                Icons.play_arrow,
+                                                color: Colors.white,
+                                                size: 20,
+                                              ),
+                                              const SizedBox(width: 4),
+                                              Text(
+                                                'Başlat',
+                                                style: TextStyle(
+                                                  color: Colors.white,
+                                                  fontWeight: FontWeight.bold,
+                                                  fontSize: 14,
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
                                       ),
                                     ),
-                                    const SizedBox(height: 4),
+                                  ),
+                                ],
+                              ),
+                              // Alternative Routes Section
+                              if (alternativeRoutes.length > 1) ...[
+                                const SizedBox(height: 12),
+                                const Divider(),
+                                const SizedBox(height: 8),
+                                Row(
+                                  children: [
+                                    Icon(
+                                      Icons.alt_route,
+                                      color: AppTheme.primaryBlue,
+                                      size: 20,
+                                    ),
+                                    const SizedBox(width: 8),
                                     Text(
-                                      "${routeDistanceKm!.toStringAsFixed(2)} km • ${routeDurationMin!.toStringAsFixed(0)} dk",
-                                      style: AppTheme.bodyLarge.copyWith(
+                                      'Alternatif Rotalar (${alternativeRoutes.length})',
+                                      style: AppTheme.bodyMedium.copyWith(
+                                        fontWeight: FontWeight.w600,
                                         color: AppTheme.textPrimary,
-                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    const Spacer(),
+                                    Container(
+                                      decoration: BoxDecoration(
+                                        color: AppTheme.primaryBlue.withOpacity(
+                                          0.1,
+                                        ),
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      child: Material(
+                                        color: Colors.transparent,
+                                        child: InkWell(
+                                          onTap: () =>
+                                              _showRouteSelectionDialog(),
+                                          borderRadius: BorderRadius.circular(
+                                            8,
+                                          ),
+                                          child: Padding(
+                                            padding: const EdgeInsets.symmetric(
+                                              horizontal: 12,
+                                              vertical: 8,
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Icon(
+                                                  Icons.list,
+                                                  color: AppTheme.primaryBlue,
+                                                  size: 16,
+                                                ),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  'Seç',
+                                                  style: AppTheme.bodySmall
+                                                      .copyWith(
+                                                        color: AppTheme
+                                                            .primaryBlue,
+                                                        fontWeight:
+                                                            FontWeight.w600,
+                                                      ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
                                       ),
                                     ),
                                   ],
                                 ),
-                              ),
-                              Container(
-                                decoration: BoxDecoration(
-                                  gradient: AppTheme.primaryGradient,
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                child: Material(
-                                  color: Colors.transparent,
-                                  child: InkWell(
-                                    onTap: startNavigation,
-                                    borderRadius: BorderRadius.circular(12),
-                                    child: Padding(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 16,
-                                        vertical: 8,
-                                      ),
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Icon(
-                                            Icons.play_arrow,
-                                            color: Colors.white,
-                                            size: 20,
-                                          ),
-                                          const SizedBox(width: 4),
-                                          Text(
-                                            'Başlat',
-                                            style: TextStyle(
-                                              color: Colors.white,
-                                              fontWeight: FontWeight.bold,
-                                              fontSize: 14,
-                                            ),
-                                          ),
-                                        ],
+                                const SizedBox(height: 8),
+                                // Current selected route info
+                                Container(
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    color: AppTheme.primaryBlue.withOpacity(
+                                      0.05,
+                                    ),
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(
+                                      color: AppTheme.primaryBlue.withOpacity(
+                                        0.2,
                                       ),
                                     ),
                                   ),
+                                  child: Row(
+                                    children: [
+                                      Icon(
+                                        Icons.check_circle,
+                                        color: AppTheme.primaryBlue,
+                                        size: 20,
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Text(
+                                              alternativeRoutes[selectedRouteIndex]['description']
+                                                  as String,
+                                              style: AppTheme.bodyMedium
+                                                  .copyWith(
+                                                    fontWeight: FontWeight.w600,
+                                                    color: AppTheme.textPrimary,
+                                                  ),
+                                            ),
+                                            const SizedBox(height: 2),
+                                            Text(
+                                              '${(alternativeRoutes[selectedRouteIndex]['distance'] as double).toStringAsFixed(1)} km • ${(alternativeRoutes[selectedRouteIndex]['duration'] as double).toStringAsFixed(0)} dk',
+                                              style: AppTheme.bodySmall
+                                                  .copyWith(
+                                                    color:
+                                                        AppTheme.textSecondary,
+                                                  ),
+                                            ),
+                                            const SizedBox(height: 2),
+                                            Row(
+                                              children: [
+                                                Icon(
+                                                  Icons.accessible,
+                                                  size: 14,
+                                                  color: AppTheme.primaryBlue,
+                                                ),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  'Erişilebilirlik: ${_calculateRouteAccessibilityScore(alternativeRoutes[selectedRouteIndex]).toStringAsFixed(0)}',
+                                                  style: AppTheme.bodySmall
+                                                      .copyWith(
+                                                        color: AppTheme
+                                                            .primaryBlue,
+                                                        fontWeight:
+                                                            FontWeight.w600,
+                                                      ),
+                                                ),
+                                              ],
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      Icon(
+                                        Icons.arrow_forward_ios,
+                                        color: AppTheme.primaryBlue,
+                                        size: 16,
+                                      ),
+                                    ],
+                                  ),
                                 ),
-                              ),
+                              ],
                             ],
                           ),
                         ),
@@ -2417,8 +3280,8 @@ class _MapPageState extends State<MapPage> {
                       ),
                     ),
 
-                  // Marker Count Info (only show when navigation is not started)
-                  if (!isNavigationStarted)
+                  // Marker Count Info (only show when navigation is not started and no route is created)
+                  if (!isNavigationStarted && routePoints.isEmpty)
                     AnimatedOpacity(
                       opacity: 1.0,
                       duration: const Duration(milliseconds: 300),
@@ -2484,8 +3347,8 @@ class _MapPageState extends State<MapPage> {
                       ),
                     ),
 
-                  // Filter Controls (only show when navigation is not started)
-                  if (!isNavigationStarted)
+                  // Filter Controls (only show when navigation is not started and no route is created)
+                  if (!isNavigationStarted && routePoints.isEmpty)
                     Container(
                       margin: const EdgeInsets.symmetric(
                         horizontal: 16,
@@ -2512,8 +3375,8 @@ class _MapPageState extends State<MapPage> {
                       ),
                     ),
 
-                  // Action Buttons (only show when navigation is not started)
-                  if (!isNavigationStarted)
+                  // Action Buttons (only show when navigation is not started and no route is created)
+                  if (!isNavigationStarted && routePoints.isEmpty)
                     Container(
                       margin: const EdgeInsets.symmetric(
                         horizontal: 16,
@@ -2545,6 +3408,39 @@ class _MapPageState extends State<MapPage> {
                                 if (pos == null) {
                                   _showMessage('Konum alınamadı');
                                   return;
+                                }
+
+                                // Önce noktanın yol üzerinde olup olmadığını kontrol et
+                                final isOnRoad = await _isPointOnRoad(pos);
+
+                                LatLng finalPoint = pos;
+
+                                if (!isOnRoad) {
+                                  // Yolda değilse snap to road dene
+                                  final snapResult = await _snapToRoad(pos);
+
+                                  if (snapResult['success']) {
+                                    final snappedPoint =
+                                        snapResult['snappedPoint'] as LatLng;
+                                    final distance =
+                                        snapResult['distance'] as double;
+
+                                    // Sadece küçük taşma miktarlarında (10 metre altı) snap yap
+                                    if (distance <= 10) {
+                                      finalPoint = snappedPoint;
+                                      _showMessage(
+                                        'Konum en yakın yola ${distance.toStringAsFixed(1)} metre mesafeye taşındı.',
+                                      );
+                                    } else {
+                                      // Çok uzaksa "yolda değilsin" mesajı göster
+                                      _showMessage('Lütfen yola ekleyin');
+                                      return;
+                                    }
+                                  } else {
+                                    // Snap başarısızsa "yolda değilsin" mesajı göster
+                                    _showMessage('Lütfen yola ekleyin');
+                                    return;
+                                  }
                                 }
 
                                 String? selectedType =
@@ -2706,8 +3602,10 @@ class _MapPageState extends State<MapPage> {
                                         .add(
                                           MarkerModel(
                                             type: selectedType,
-                                            latitude: pos.latitude,
-                                            longitude: pos.longitude,
+                                            latitude: finalPoint
+                                                .latitude, // Final koordinatlar (snap edilmiş veya orijinal)
+                                            longitude: finalPoint
+                                                .longitude, // Final koordinatlar (snap edilmiş veya orijinal)
                                             description: description,
                                             likes: 0,
                                             createdAt: DateTime.now(),
